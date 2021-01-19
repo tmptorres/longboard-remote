@@ -1,0 +1,194 @@
+/*
+   Dec 2014 - TMRh20 - Updated
+   Derived from examples by J. Coliz <maniacbug@ymail.com>
+*/
+/**
+   Example for efficient call-response using ack-payloads
+
+   This example continues to make use of all the normal functionality of the radios including
+   the auto-ack and auto-retry features, but allows ack-payloads to be written optionlly as well.
+   This allows very fast call-response communication, with the responding radio never having to
+   switch out of Primary Receiver mode to send back a payload, but having the option to switch to
+   primary transmitter if wanting to initiate communication instead of respond to a commmunication.
+*/
+
+/* TODO:
+ *  
+ */
+
+#include <SPI.h>
+#include "RF24.h"
+#include <printf.h>
+#include <Servo.h>		// Disables analogWrite() on pins 9 and 10
+
+#include "structures.h"
+#include "typeSwitch.h"
+
+
+/* ---------------------------- Configs/Inits ---------------------------- */
+
+// General Configs
+#define CONTROLRATE 50                       // 100Hz (Servo PWM Signals are 50Hz)
+#define CONTROLER_LED1_PIN 2
+#define CONTROLER_BUTTON1_PIN 3
+
+// Radio Configs
+rf24_datarate_e dataRate = RF24_250KBPS;      // Datarate. Options: {1MBPS, 2MBPS, 250KBPS}
+uint8_t channelOffset = 105;                  // Range: 0 - 125. Frequency is 2.4Ghz + channelOffset * 1MHz
+
+byte addresses[][6] = { "~Tmp^", "^Tmp~"};   // Radio pipe addresses for the 2 nodes to communicate.
+#ifdef RADIO_CONTROLER
+  byte *localAddress  = addresses[0];
+  byte *remoteAddress = addresses[1];
+#endif
+#ifdef RADIO_RECIEVER
+  byte *localAddress  = addresses[1];
+  byte *remoteAddress = addresses[0];
+#endif
+
+#ifdef DEBUG
+  uint8_t PALevel = RF24_PA_LOW;              // Options {MIN,LOW,HIGH,MAX}. Default is RF24_PA_MAX
+#else
+  uint8_t PALevel = RF24_PA_MAX;
+#endif
+
+// Servo
+#define SERVO_PWM_PIN 9
+#define SERVO_MINPULSE 1000         // Minimum pulse witdth in microseconds (us)
+#define SERVO_MAXPULSE 2000         // Maximum pulse witdth in microseconds (us)
+
+// Initializations/Allocations
+Servo servo;
+
+// Hardware configuration: Set up nRF24L01 radio on SPI bus plus pins 7 & 8
+#define CE_PIN 7  // Chip Enable pin
+#define CSN_PIN 8 // Chip Select pin
+RF24 radio(CE_PIN, CSN_PIN);
+
+
+/* ---------------------------- Setup ---------------------------- */
+
+void setup() {
+
+  #ifdef DEBUG
+    Serial.begin(115200);
+    printf_begin();  // This enables the program's calls to Serial.print to be directed to the Arduino's IDE serial monitor
+                     // Used in radio.printDetails()
+    Serial.println(F("Beggining"));
+  #endif
+
+  // Setup and configure radios
+  radio.begin();
+  radio.setChannel(channelOffset);
+  radio.setPALevel(PALevel);
+  radio.setDataRate(dataRate);
+  radio.setCRCLength(RF24_CRC_16);              // Use 8-bit CRC for performance
+
+  // Set payload sizes to avoid sending packets padded with zeros in the end
+  radio.setPayloadSize( max( sizeof(packet2Recv), sizeof(packet2Cont) ) );
+
+  radio.openWritingPipe(remoteAddress);         // Both radios listen on the same pipes by default, but opposite addresses
+  radio.openReadingPipe(1, localAddress);       // Open a reading pipe on address 0, pipe 1
+  radio.startListening();                       // Start listening
+
+  #ifdef RADIO_CONTROLER
+    pinMode(CONTROLER_LED1_PIN, OUTPUT);
+    pinMode(CONTROLER_BUTTON1_PIN, INPUT_PULLUP);
+  #endif
+  #ifdef RADIO_RECIEVER
+    servo.attach(SERVO_PWM_PIN, SERVO_MINPULSE, SERVO_MAXPULSE);
+  #endif
+
+  #ifdef DEBUG
+    radio.printDetails();                       // Needs printf_begin() in setup
+  #endif
+}
+
+
+/* ---------------------------- Controler ---------------------------- */
+#ifdef RADIO_CONTROLER
+void loop(void) {
+  packet2Recv packetSend;
+  packet2Cont packetRecv;
+
+  // Build packet to send
+  packetSend.servoPulse = map(analogRead(A0), 0, 1023, SERVO_MINPULSE, SERVO_MAXPULSE);
+
+  // Send
+  radio.stopListening();                        // First, stop listening so we can talk
+  if ( radio.write(&packetSend, sizeof(packet2Recv)) ) {
+    // If sent
+    #ifdef DEBUG
+      Serial.print(F("Sent pulse "));
+      Serial.print(packetSend.servoPulse);
+      Serial.print(F(" Button "));
+      Serial.println(digitalRead(CONTROLER_BUTTON1_PIN));
+      digitalWrite(CONTROLER_LED1_PIN, HIGH);
+    #endif
+  } else {
+    #ifdef DEBUG
+      Serial.print(F("Sending failed "));     // If no ack response, sending failed
+      Serial.println(millis());
+    #endif
+  }
+
+  // Recieve
+  radio.startListening();
+  while ( radio.available() ){
+    radio.read(&packetRecv, sizeof(packet2Cont));
+    // If recieved
+    #ifdef DEBUG
+      Serial.print(F("Recieved voltage "));
+      Serial.println(packetRecv.batVoltage);
+    #endif
+  }
+
+  // End commands
+  //delay( 1e3 / CONTROLRATE - (millis() - time) );
+  delay( 10 );
+  digitalWrite(CONTROLER_LED1_PIN, LOW);
+}
+#endif
+
+/* ---------------------------- Reciever ---------------------------- */
+#ifdef RADIO_RECIEVER
+void loop(void) {
+  packet2Recv packetRecv;
+  packet2Cont packetSend;
+
+  // Recieve
+  
+  while ( radio.available() ){
+    radio.read(&packetRecv, sizeof(packet2Recv));
+    // If recieved
+    servo.writeMicroseconds( packetRecv.servoPulse );
+    #ifdef DEBUG
+      Serial.print(F("<Received servoPulse "));            // Use a simple byte counter as payload
+      Serial.println(packetRecv.servoPulse);
+    #endif
+
+    // Build packet to send
+    packetSend.batVoltage = map(analogRead(A0), 0, 1023, 0, 1023);
+  
+    // Send
+    radio.stopListening();                        // First, stop listening so we can talk
+    if ( radio.write(&packetSend, sizeof(packet2Recv)) ) {
+      // If sent
+      #ifdef DEBUG
+        Serial.print(F("Sent voltage "));
+        Serial.println(packetSend.batVoltage);
+      #endif
+    } else {
+      #ifdef DEBUG
+        Serial.print(F("Sending failed "));     // If no ack response, sending failed
+        Serial.println(millis());
+      #endif
+    }
+    radio.startListening();
+  }
+
+  // End commands
+  
+}
+#endif
+
